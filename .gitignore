@@ -1,0 +1,15 @@
+.env
+
+node_modules
+
+*.log
+
+.vscode
+
+.idea
+
+coverage
+
+__pycache__
+
+.pytest_cache
