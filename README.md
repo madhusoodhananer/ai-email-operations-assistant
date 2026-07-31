@@ -93,6 +93,7 @@ ai-email-operations-assistant/
 ├── database/       # Schema definitions, migrations, and seed data
 ├── docker/         # Container definitions and local orchestration
 ├── docs/           # Architecture, requirements, data model, and ADRs
+│   └── architecture/adr/   # Architecture decision records, one file each
 ├── frontend/       # Review and operations console
 ├── n8n/            # n8n workflow definitions and exported pipelines
 ├── prompts/        # Versioned LLM prompt templates
