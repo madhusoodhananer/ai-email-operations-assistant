@@ -12,17 +12,18 @@
 
 Shared inboxes are one of the most expensive unmanaged queues in a business. Support, sales, billing, and operations mail arrives unstructured, is triaged manually, and is routed by tribal knowledge — which makes response times unpredictable and quality inconsistent.
 
-**AI Email Operations Assistant** treats that inbox as a production pipeline. Every inbound message is ingested, classified, structured, enriched with an AI-generated draft reply, and routed to the owning team — with retries, audit logging, and a human review path built in from the start.
+**AI Email Operations Assistant** treats that inbox as a production pipeline. The system is designed to ingest, classify, and structure each inbound message, route it to the owning team, and propose a draft reply where one is warranted — with retries, audit logging, and a human review path designed in from the start rather than added later.
+
+The project is in its documentation and design stage. The [roadmap](#roadmap) reflects what is built; everything else is specified, not yet running.
 
 The project is deliberately built to enterprise software engineering standards: documented architecture, explicit design decisions, a defined data model, and testable components — not a single monolithic automation.
 
-## Core Capabilities
+## Designed Capabilities
 
 | Capability | Description |
 | --- | --- |
-| **Email classification** | Categorizes inbound mail by intent, topic, and urgency using an LLM-backed classifier with a controlled label taxonomy. |
-| **Structured extraction** | Pulls entities and business fields (order IDs, account references, dates, amounts, sentiment) into a normalized schema. |
-| **AI draft generation** | Produces context-aware draft replies grounded in the extracted data and team-specific tone and policy prompts. |
+| **Classification & extraction** | Categorizes by intent and urgency and pulls structured business fields into a validated schema — in a **single** model call, so the two can never disagree and cost is not paid twice. |
+| **AI draft generation** | Produces context-aware draft replies grounded in the extracted data, generated only for messages that pass the confidence and routing checks. |
 | **Intelligent routing** | Directs each message to the correct business team or queue based on classification, confidence, and routing rules. |
 | **Retry & failure handling** | Isolates transient failures, applies bounded retries with backoff, and escalates poison messages to a dead-letter path. |
 | **Audit logging** | Persists a traceable record of every decision — inputs, model outputs, confidence, and final action — for compliance and debugging. |
@@ -30,53 +31,33 @@ The project is deliberately built to enterprise software engineering standards: 
 
 ## Architecture
 
-```
-                  Inbound Email
-                        │
-                        ▼
-            ┌────────────────────────┐
-            │       Ingestion        │
-            │         (n8n)          │
-            └───────────┬────────────┘
-                        │
-                        ▼
-            ┌────────────────────────┐
-            │     Classification     │
-            │         (LLM)          │
-            └───────────┬────────────┘
-                        │
-                        ▼
-            ┌────────────────────────┐
-            │       Extraction       │
-            │         (LLM)          │
-            └───────────┬────────────┘
-                        │
-                        ▼
-            ┌────────────────────────┐
-            │    Draft Generation    │
-            │         (LLM)          │
-            └───────────┬────────────┘
-                        │
-                        ▼
-            ┌────────────────────────┐
-            │   Routing & Decision   │
-            │         Engine         │
-            └─┬───────────────────┬──┘
-   confident  │                   │  low confidence
-              ▼                   ▼
-      ┌────────────────┐  ┌────────────────┐
-      │   Team Queue   │  │ Manual Review  │
-      └───────┬────────┘  └───────┬────────┘
-              │                   │
-              └─────────┬─────────┘
-                        │
-                        ▼
-            ┌────────────────────────┐
-            │ Audit Log + Data Store │
-            └────────────────────────┘
+```mermaid
+flowchart TD
+    A[Inbound email] --> B[Normalization]
+    B --> C[Classification + Extraction<br/><b>single model call</b>]
+    C --> D[Schema validation]
+    D -->|invalid| R[Manual review]
+    D -->|valid| E{Confidence<br/>above threshold?}
+    E -->|no| R
+    E -->|yes| F[Business routing]
+    F --> G{Draft required?}
+    G -->|no| H[Complete]
+    G -->|yes| I[Draft generation]
+    I --> H
+    R --> H
 
-        Cross-cutting: retry policy · dead-letter queue · observability
+    classDef ai fill:#2d3f5f,stroke:#5b8dd9,color:#fff
+    classDef human fill:#5f452d,stroke:#d9a05b,color:#fff
+    class C,I ai
+    class R human
 ```
+
+Two properties of this order are deliberate:
+
+- **Classification and extraction are one call, not two.** They read the same message and need the same context. Splitting them doubles cost and latency and allows the two results to disagree.
+- **Drafting runs after the confidence and routing checks.** It is the most expensive step, so it is never spent on spam, on messages the model did not understand, or on messages headed for review.
+
+Every step writes an attempt record, and external side effects are dispatched through a transactional outbox rather than called inline. See [`docs/architecture.md`](docs/architecture.md).
 
 Detailed design documentation lives in [`docs/`](docs/):
 
@@ -89,12 +70,11 @@ Detailed design documentation lives in [`docs/`](docs/):
 
 ```
 ai-email-operations-assistant/
-├── api/            # Backend service endpoints and integration layer
+├── api/            # Transactional write block, model abstraction, validation
 ├── database/       # Schema definitions, migrations, and seed data
 ├── docker/         # Container definitions and local orchestration
 ├── docs/           # Architecture, requirements, data model, and ADRs
 │   └── architecture/adr/   # Architecture decision records, one file each
-├── frontend/       # Review and operations console
 ├── n8n/            # n8n workflow definitions and exported pipelines
 ├── prompts/        # Versioned LLM prompt templates
 ├── sample-data/    # Representative email fixtures for development
@@ -103,15 +83,16 @@ ai-email-operations-assistant/
 
 ## Technology Stack
 
-| Layer | Technology |
-| --- | --- |
-| Workflow orchestration | n8n |
-| Intelligence | Large language models (classification, extraction, drafting) |
-| Persistence | Relational database for state and audit logs |
-| Packaging | Docker |
-| Interface | Web-based review console |
+| Layer | Technology | Decision |
+| --- | --- | --- |
+| Workflow orchestration | n8n | — |
+| Persistence | PostgreSQL | [ADR-001](docs/architecture/adr/ADR-001-database-choice.md) |
+| Intelligence | OpenAI, behind a provider abstraction | [ADR-002](docs/architecture/adr/ADR-002-ai-provider.md) |
+| Consistency | Database constraints + transactional outbox | [ADR-003](docs/architecture/adr/ADR-003-idempotency.md) |
+| Packaging | Docker Compose | — |
+| Interface | Review console *(Version 2)* | — |
 
-> Concrete technology selections are recorded as they are made in [`docs/decisions.md`](docs/decisions.md).
+> Each selection and the alternatives rejected are recorded in [`docs/decisions.md`](docs/decisions.md).
 
 ## Getting Started
 
