@@ -19,6 +19,7 @@ Records are immutable: once a decision is accepted it is not edited in place. If
 | [ADR-001](architecture/adr/ADR-001-database-choice.md) | Use PostgreSQL as the primary data store | Accepted | 2026-07-31 |
 | [ADR-002](architecture/adr/ADR-002-ai-provider.md) | Use OpenAI as the initial LLM provider, behind a provider abstraction | Accepted | 2026-07-31 |
 | [ADR-003](architecture/adr/ADR-003-idempotency.md) | Enforce idempotency with database constraints and a transactional outbox | Accepted | 2026-07-31 |
+| [ADR-004](architecture/adr/ADR-004-processing-runs.md) | Model processing runs as the execution boundary | Accepted | 2026-08-02 |
 
 ## Writing a new record
 

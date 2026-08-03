@@ -29,6 +29,11 @@ Two specific problems have to be solved rather than assumed away.
 
 Idempotency is enforced **by the database**, and external side effects are dispatched **through a transactional outbox**. Workflow logic may optimize, but it is never the guarantee.
 
+> Note: ADR-004 later introduces `processing_runs` as the execution boundary.
+> The principle in this ADR remains accepted, but current table-level constraints
+> should be read from [the data model](../../data-model.md) and ADR-004 where
+> they involve runs, attempts, current outcomes, or leases.
+
 ### 1. Uniqueness lives in the schema
 
 | Table | Constraint | Meaning |
