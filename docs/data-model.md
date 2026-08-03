@@ -1,66 +1,96 @@
 # Data Model
 
-**Status:** Draft — Version 1
-**Last updated:** 2026-07-31
+**Status:** Draft - Version 1 logical model
+**Last updated:** 2026-08-02
 
-The data model exists to answer questions after the fact, not merely to store model output:
+This document defines the logical data model for the AI Email Operations Assistant.
+It intentionally comes before SQL migrations. The goal is to settle ownership,
+state, idempotency, auditability, and recovery semantics before we turn decisions
+into PostgreSQL constraints.
 
-- Which email was processed, and once or more than once?
-- What did the model decide, using which model and which prompt version?
-- Was that decision accepted, or sent for review?
-- Was a draft generated, and from which analysis?
-- Did any step fail, and how many times before it succeeded?
-- Can an administrator reprocess it without destroying what happened before?
+The model exists to answer operational and audit questions after the fact:
 
-The store is PostgreSQL, as decided in [ADR-001](architecture/adr/ADR-001-database-choice.md). Constraint names and uniqueness rules follow [ADR-003](architecture/adr/ADR-003-idempotency.md), which is the authority on why they exist.
+- Which source email was received, and was it delivered more than once?
+- Which processing run handled it, and why was that run started?
+- Which model and prompt produced the analysis?
+- Which routing decision was accepted as current?
+- Was a sales lead, draft, review item, or notification produced?
+- Which attempts failed before the final outcome?
+- Can an administrator reprocess without destroying earlier evidence?
+
+The store is PostgreSQL, as decided in [ADR-001](architecture/adr/ADR-001-database-choice.md).
+Idempotency and transactional outbox rules follow [ADR-003](architecture/adr/ADR-003-idempotency.md).
 
 ---
 
 ## 1. Design principles
 
-**Three concerns stay separate.** Source email data, model output, and execution history are distinct tables. Collapsing them into one wide record makes the history unauditable, because each reprocessing would overwrite the evidence of the last.
+**Separate business facts from execution history.** An email, an analysis, a
+route, a draft, and an attempt are different things. Combining them into one wide
+record would make retries and reprocessing hard to audit.
 
-**History is append-only.** Analyses, drafts, and attempts accumulate. Reprocessing after a prompt change adds a record; it does not replace one.
+**Treat reprocessing as a first-class concept.** A message may be processed once
+initially and later reprocessed after a prompt, model, threshold, or integration
+change. That second pass is not a retry; it is a new run.
 
-**Invariants live in the schema.** Every uniqueness rule below is a database constraint, not a workflow check. See ADR-003 for why the check-then-insert alternative does not hold under concurrency.
+**Retries stay inside a run.** Transient failures such as timeouts and rate
+limits create more `processing_attempts` for the same `processing_run`. They do
+not create a new analysis or a new business decision unless the step eventually
+succeeds.
+
+**Current state is explicit.** Historical records are preserved, but the system
+still needs one current accepted outcome per email. That pointer is represented
+through `processing_runs.is_current`, protected by a partial unique index.
+
+**External side effects are outbox-driven.** The database transaction records
+the business result and the intent to notify. Slack, email, or webhook delivery
+happens later from `outbox_events`.
+
+---
 
 ## 2. Entity relationships
 
 ```mermaid
 erDiagram
-    email_messages ||--o{ email_analyses : "analyzed by"
-    email_messages ||--o| sales_leads : "may produce"
-    email_messages ||--o{ email_drafts : "may have"
-    email_messages ||--o{ processing_attempts : "records"
-    email_messages ||--o{ manual_reviews : "may raise"
-    email_analyses ||--o{ email_drafts : "produces"
-    email_analyses ||--o{ manual_reviews : "may raise"
+    mailboxes ||--o{ email_messages : "receives"
+    email_messages ||--o{ processing_runs : "processed by"
+    processing_runs ||--o{ processing_attempts : "records"
+    processing_runs ||--o{ email_analyses : "produces"
+    email_analyses ||--o| routing_decisions : "routes"
+    email_analyses ||--o| sales_leads : "may create"
+    email_analyses ||--o{ email_drafts : "may generate"
+    processing_runs ||--o{ manual_reviews : "may raise"
 ```
 
-`outbox_events` is intentionally not related by foreign key — it references business entities polymorphically so that any entity type can enqueue an external effect.
+`outbox_events` intentionally has no foreign key to one specific business table.
+It references entities polymorphically so any committed outcome can enqueue an
+external effect.
 
-**Why multiple analyses and drafts per email.** An administrator may reprocess a message after changing a prompt, changing a model, correcting the message content, or fixing an integration. Earlier results are evidence of what the system decided at the time and are preserved rather than overwritten.
+Core ownership rule:
+
+```text
+email_message -> processing_run -> analysis -> route / lead / draft / review
+```
+
+The email is the source fact. The processing run is the execution boundary. The
+analysis is the model decision. The downstream records are business outcomes of
+that decision.
 
 ---
 
-## 3. `email_messages`
+## 3. `mailboxes`
 
-The normalized inbound email. One row per source message, however many times it is delivered.
+The configured inbound mailbox or shared inbox. Version 1 integrates only one
+provider/mailbox, but modelling this now avoids hard-coding provider assumptions
+into every email row.
 
 | Field | Type | Null | Purpose |
 | --- | --- | --- | --- |
 | `id` | UUID | no | Primary key |
 | `provider` | text | no | `gmail`, `outlook`, `webhook` |
-| `provider_message_id` | text | no | Identifier assigned by the source system |
-| `thread_id` | text | yes | Groups related messages |
-| `from_email` | text | no | Sender address |
-| `from_name` | text | yes | Sender display name |
-| `to_email` | text | no | Recipient address |
-| `subject` | text | no | Subject, empty string if absent |
-| `body_text` | text | no | Cleaned plain-text body |
-| `received_at` | timestamptz | no | Arrival time at the provider |
-| `has_attachments` | boolean | no | Presence only; content is not parsed in V1 |
-| `processing_status` | enum | no | Lifecycle state, default `received` |
+| `address` | text | no | Shared inbox address |
+| `display_name` | text | yes | Human-friendly mailbox name |
+| `is_active` | boolean | no | Whether ingestion is enabled |
 | `created_at` | timestamptz | no | Record creation |
 | `updated_at` | timestamptz | no | Last modification |
 
@@ -68,158 +98,105 @@ The normalized inbound email. One row per source message, however many times it 
 
 | Rule | Purpose |
 | --- | --- |
-| `UNIQUE (provider, provider_message_id)` | The system's deduplication guarantee. Webhook redelivery hits this constraint and returns the existing row. |
-
-**Indexes:** `(processing_status, received_at)` for queue scans, `(thread_id)`, `(from_email)`.
-
-**Status lifecycle**
-
-```
-received → processing → processed
-                     → manual_review
-                     → failed
-received → ignored
-```
-
-| Status | Meaning |
-| --- | --- |
-| `received` | Persisted, not yet worked on |
-| `processing` | Claimed by an execution |
-| `processed` | Completed successfully |
-| `manual_review` | Awaiting human resolution |
-| `failed` | Permanently failed; not retryable without intervention |
-| `ignored` | Deliberately excluded, e.g. automated bounce |
+| `UNIQUE (provider, address)` | Prevents duplicate configuration for the same inbox |
 
 ---
 
-## 4. `email_analyses`
+## 4. `email_messages`
 
-Classification and extraction output. Written by a single model call (see [architecture.md](architecture.md#4-processing-flow)).
+The normalized inbound email. One row exists per source message, no matter how
+many times the provider delivers it.
 
 | Field | Type | Null | Purpose |
 | --- | --- | --- | --- |
 | `id` | UUID | no | Primary key |
-| `email_message_id` | UUID | no | → `email_messages.id` |
-| `category` | text | no | Classified category |
-| `priority` | enum | no | `low`, `medium`, `high`, `critical` |
-| `confidence` | numeric(4,3) | no | Model confidence, 0.000–1.000 |
-| `confidence_threshold` | numeric(4,3) | no | Threshold applied **at the time of this decision** |
-| `summary` | text | yes | Short generated summary |
-| `recommended_action` | text | yes | Suggested next step |
-| `requires_draft` | boolean | no | Whether a draft should be generated |
-| `requires_manual_review` | boolean | no | Whether a human must review |
-| `model_name` | text | no | Pinned model identifier |
-| `prompt_version` | text | no | e.g. `email-classifier-v1.0` |
-| `input_hash` | text | no | Hash of the normalized input |
-| `idempotency_key` | text | no | See below |
-| `raw_response` | jsonb | no | Unmodified model output |
-| `created_at` | timestamptz | no | Analysis time |
-
-**Constraints**
-
-| Rule | Purpose |
-| --- | --- |
-| `UNIQUE (idempotency_key)` | One stored analysis per logical classification operation |
-
-**Indexes:** `(email_message_id, created_at DESC)`.
-
-**Idempotency key**
-
-```
-classification : <email_message_id> : <prompt_version> : <model_name> : <input_hash>
-```
-
-`input_hash` is computed over sender address, subject, and cleaned body with whitespace collapsed — and nothing else. Timestamps, headers, and provider identifiers are excluded: any volatile input makes the key unmatchable on retry and silently disables the deduplication it exists to provide.
-
-A deliberate prompt or model change produces a different key and therefore a new analysis. That is the intended reprocessing behavior.
-
-**Why `confidence_threshold` is stored.** The threshold is configurable. Without recording the value in force at decision time, a later change makes every historical review decision uninterpretable — it becomes impossible to tell which reviews the old rule produced.
-
-**Why `prompt_version` is stored.** If `email-classifier-v1.0` performs poorly and `v2.0` replaces it, the messages processed under each must be identifiable. This is the difference between an auditable system and one that merely works today.
-
----
-
-## 5. `sales_leads`
-
-Created only when the category is a sales inquiry. Business data is kept out of the analysis table so that CRM-shaped concerns do not contaminate the model-output record.
-
-| Field | Type | Null |
-| --- | --- | --- |
-| `id` | UUID | no |
-| `email_message_id` | UUID | no |
-| `customer_name` | text | yes |
-| `customer_type` | text | yes |
-| `company_name` | text | yes |
-| `contact_email` | text | no |
-| `phone` | text | yes |
-| `address` | text | yes |
-| `website` | text | yes |
-| `service_requested` | text | yes |
-| `requirement_summary` | text | yes |
-| `budget_amount` | numeric(14,2) | yes |
-| `budget_currency` | char(3) | yes |
-| `urgency` | text | yes |
-| `lead_status` | enum | no |
-| `created_at` | timestamptz | no |
-| `updated_at` | timestamptz | no |
-
-**Constraints**
-
-| Rule | Purpose |
-| --- | --- |
-| `UNIQUE (email_message_id)` | Version 1 assumes at most one lead per email |
-
-Nearly every field is nullable because extraction is best-effort: a sales email that omits a budget is still a lead. Only `contact_email` is required, because a lead with no way to reply is not a lead.
-
----
-
-## 6. `email_drafts`
-
-Drafts are separate from analyses because a draft may be regenerated, may be edited by a human, and may end up differing from what the model produced. Many messages never have one.
-
-| Field | Type | Null | Purpose |
-| --- | --- | --- | --- |
-| `id` | UUID | no | Primary key |
-| `email_message_id` | UUID | no | → `email_messages.id` |
-| `analysis_id` | UUID | no | → `email_analyses.id` |
-| `draft_version` | integer | no | 1, 2, 3 … |
-| `draft_subject` | text | no | Proposed reply subject |
-| `draft_body` | text | no | Proposed reply body |
-| `status` | enum | no | Draft lifecycle |
-| `model_name` | text | no | Model used |
-| `prompt_version` | text | no | Draft prompt version |
-| `idempotency_key` | text | no | `draft:<analysis_id>:<prompt_version>` |
-| `created_at` | timestamptz | no | Creation |
+| `mailbox_id` | UUID | no | -> `mailboxes.id` |
+| `provider` | text | no | Copied from the source for idempotency and audit |
+| `provider_message_id` | text | no | Stable identifier assigned by the provider |
+| `thread_id` | text | yes | Provider thread or conversation identifier |
+| `from_email` | text | no | Sender address |
+| `from_name` | text | yes | Sender display name |
+| `to_emails` | text[] | no | Normalized recipients; Version 1 may contain one |
+| `cc_emails` | text[] | no | Empty array when absent |
+| `subject` | text | no | Empty string if absent |
+| `body_text` | text | no | Cleaned plain-text body |
+| `received_at` | timestamptz | no | Arrival time at the provider |
+| `has_attachments` | boolean | no | Presence only; content is not parsed in Version 1 |
+| `ingestion_status` | enum | no | `received`, `ignored`, `quarantined` |
+| `created_at` | timestamptz | no | Record creation |
 | `updated_at` | timestamptz | no | Last modification |
 
 **Constraints**
 
 | Rule | Purpose |
 | --- | --- |
-| `UNIQUE (email_message_id, analysis_id, draft_version)` | Multiple versions are legitimate; the same version twice is not |
-| `UNIQUE (idempotency_key)` | A workflow retry cannot create a second version 1 |
+| `UNIQUE (provider, provider_message_id)` | Deduplicates provider redelivery |
 
-**Status values:** `generated` → `reviewed` → `approved` / `edited` / `discarded` → `sent`.
+**Indexes:** `(mailbox_id, received_at DESC)`, `(thread_id)`, `(from_email)`.
 
-`sent` exists in the vocabulary but is unreachable in Version 1, which creates drafts and never sends them (FR-13).
+Why the old `processing_status` moves out: processing is not a property of the
+email itself once reprocessing exists. The email can have many runs, so run state
+belongs in `processing_runs`.
 
 ---
 
-## 7. `processing_attempts`
+## 5. `processing_runs`
 
-The table that makes retries visible. Without it, the system records only that processing eventually succeeded — not that the first two attempts timed out.
+A processing run is one deliberate pass over an email. This is the central
+execution boundary for retries, leases, reprocessing, and current outcome.
 
 | Field | Type | Null | Purpose |
 | --- | --- | --- | --- |
 | `id` | UUID | no | Primary key |
-| `email_message_id` | UUID | no | → `email_messages.id` |
-| `step_name` | text | no | e.g. `classify_email`, `generate_draft` |
-| `attempt_number` | integer | no | 1-based retry counter |
+| `email_message_id` | UUID | no | -> `email_messages.id` |
+| `parent_run_id` | UUID | yes | Previous run that motivated this one |
+| `trigger_type` | enum | no | `initial`, `manual_reprocess`, `retry_recovery`, `system_replay` |
+| `triggered_by` | text | yes | User, service, or workflow that started it |
+| `idempotency_key` | text | no | Stable key for this logical run |
+| `status` | enum | no | Run lifecycle |
+| `is_current` | boolean | no | Whether this run is the accepted current outcome |
+| `config_snapshot` | jsonb | no | Thresholds, routing version, orchestration version |
+| `claimed_by` | text | yes | Worker currently holding the lease |
+| `lease_expires_at` | timestamptz | yes | Claim expiry for stuck-run recovery |
+| `started_at` | timestamptz | yes | Actual processing start |
+| `completed_at` | timestamptz | yes | Terminal time |
+| `created_at` | timestamptz | no | Record creation |
+| `updated_at` | timestamptz | no | Last modification |
+
+**Status values:** `queued`, `processing`, `completed`, `manual_review`, `failed`,
+`cancelled`, `superseded`.
+
+**Constraints**
+
+| Rule | Purpose |
+| --- | --- |
+| `UNIQUE (idempotency_key)` | Prevents duplicate logical runs |
+| `UNIQUE (email_message_id) WHERE is_current = true` | Allows only one current accepted run per email |
+| `UNIQUE (email_message_id) WHERE status IN ('queued', 'processing')` | Prevents two active workers from processing the same email |
+
+The active-run constraint is conservative. It means we cannot run two competing
+experiments on the same message at the same time. For Version 1 that is a good
+trade-off: we are optimizing for correctness and low model spend, not research
+parallelism.
+
+---
+
+## 6. `processing_attempts`
+
+Attempts make retries visible. Without this table the system can say only that
+processing eventually succeeded, not that two provider calls failed first.
+
+| Field | Type | Null | Purpose |
+| --- | --- | --- | --- |
+| `id` | UUID | no | Primary key |
+| `processing_run_id` | UUID | no | -> `processing_runs.id` |
+| `step_name` | text | no | `ingest`, `classify_extract`, `route`, `generate_draft`, `notify` |
+| `attempt_number` | integer | no | 1-based retry counter within the run and step |
 | `status` | enum | no | `started`, `success`, `failed` |
-| `error_type` | text | yes | Error category, e.g. `timeout`, `rate_limit` |
-| `error_message` | text | yes | Failure detail |
+| `error_type` | text | yes | `timeout`, `rate_limit`, `validation_error`, etc. |
+| `error_message` | text | yes | Failure detail safe for logs |
 | `http_status_code` | integer | yes | Provider response status |
-| `execution_id` | text | yes | n8n execution identifier |
+| `execution_id` | text | yes | n8n execution identifier or API request id |
 | `started_at` | timestamptz | no | Attempt start |
 | `completed_at` | timestamptz | yes | Attempt completion |
 | `duration_ms` | integer | yes | Elapsed time |
@@ -228,103 +205,286 @@ The table that makes retries visible. Without it, the system records only that p
 
 | Rule | Purpose |
 | --- | --- |
-| `UNIQUE (email_message_id, step_name, attempt_number)` | Preserves every attempt while preventing the same attempt being recorded twice |
+| `UNIQUE (processing_run_id, step_name, attempt_number)` | Keeps attempt numbering stable inside a run |
 
-**Indexes:** `(email_message_id, step_name)`.
-
-Example history — the value of the table is that all three rows survive:
-
-| Email | Step | Attempt | Status | Error |
-| --- | --- | --- | --- | --- |
-| msg-001 | `classify_email` | 1 | failed | timeout |
-| msg-001 | `classify_email` | 2 | failed | rate_limit |
-| msg-001 | `classify_email` | 3 | success | — |
-
-**Note on concurrency.** Allocating `attempt_number` is itself a race: two executions can both read the current maximum and both write the next value. The unique constraint catches this, and the resulting duplicate-key error means *another execution owns this step* — the correct response is to yield, not to retry into a loop.
+**Indexes:** `(processing_run_id, step_name)`, `(status, started_at)`.
 
 ---
 
-## 8. `manual_reviews`
+## 7. `email_analyses`
+
+The validated classification and extraction result from the single model call
+required by FR-4.
 
 | Field | Type | Null | Purpose |
 | --- | --- | --- | --- |
 | `id` | UUID | no | Primary key |
-| `email_message_id` | UUID | no | → `email_messages.id` |
-| `analysis_id` | UUID | yes | Analysis under review, if any |
-| `reason` | enum | no | Why review is required |
-| `status` | enum | no | Review state |
-| `assigned_to` | text | yes | Reviewer |
-| `review_notes` | text | yes | Human comments |
-| `resolved_category` | text | yes | Corrected category |
-| `resolved_at` | timestamptz | yes | Completion |
-| `created_at` | timestamptz | no | Queue time |
-
-**Reasons:** `low_confidence`, `invalid_ai_response`, `unsupported_attachment`, `suspicious_content`, `missing_required_data`, `processing_failed`.
-
-**Statuses:** `pending` → `in_review` → `resolved` / `dismissed`.
+| `processing_run_id` | UUID | no | -> `processing_runs.id` |
+| `email_message_id` | UUID | no | Denormalized for common queries |
+| `category` | text | no | Classified category; text until taxonomy is closed |
+| `priority` | enum | no | `low`, `medium`, `high`, `critical` |
+| `confidence` | numeric(4,3) | no | Model confidence, 0.000-1.000 |
+| `confidence_threshold` | numeric(4,3) | no | Threshold applied at decision time |
+| `summary` | text | yes | Short generated summary |
+| `recommended_action` | text | yes | Suggested next step |
+| `requires_draft` | boolean | no | Whether a reply draft should be generated |
+| `requires_manual_review` | boolean | no | Whether a human must review |
+| `extracted_payload` | jsonb | no | Validated structured fields used by the app |
+| `raw_response` | jsonb | no | Unmodified model response |
+| `model_name` | text | no | Pinned model identifier |
+| `prompt_version` | text | no | e.g. `email-classifier-v1.0` |
+| `schema_version` | text | no | Validation schema version |
+| `input_hash` | text | no | Hash of normalized model input |
+| `idempotency_key` | text | no | Stable key for this model operation |
+| `created_at` | timestamptz | no | Analysis time |
 
 **Constraints**
 
 | Rule | Purpose |
 | --- | --- |
-| `UNIQUE (email_message_id, analysis_id, reason)` | A new analysis may raise a new review; the same analysis may not raise the same one twice |
+| `UNIQUE (processing_run_id)` | One accepted analysis per run |
+| `UNIQUE (idempotency_key)` | A workflow retry cannot store duplicate analysis output |
 
-`status` is deliberately excluded from that key. Including it would let a resolved review be recreated with a different status, defeating the constraint.
+**Indexes:** `(email_message_id, created_at DESC)`, `(category, priority)`.
 
-> **Known gap.** `analysis_id` is nullable, and in PostgreSQL distinct `NULL`s do not collide. Reviews raised before any analysis exists — a failure during ingestion, for instance — will therefore **not** be deduplicated by an ordinary unique index. This requires `NULLS NOT DISTINCT` (PostgreSQL 15+), a partial index, or a sentinel value. It is a real gap, not a theoretical one.
+The split between `extracted_payload` and `raw_response` matters. The application
+uses only the validated payload. The raw response is evidence for debugging and
+auditing, not trusted business data.
 
 ---
 
-## 9. `outbox_events`
+## 8. `routing_decisions`
 
-Required by ADR-003. The business record and the intent to notify are committed in one transaction; delivery happens separately.
+The accepted route derived from an analysis.
 
 | Field | Type | Null | Purpose |
 | --- | --- | --- | --- |
 | `id` | UUID | no | Primary key |
-| `event_type` | text | no | e.g. `sales_lead_created` |
-| `entity_type` | text | no | e.g. `sales_lead` |
+| `processing_run_id` | UUID | no | -> `processing_runs.id` |
+| `analysis_id` | UUID | no | -> `email_analyses.id` |
+| `owning_team` | text | no | `sales`, `support`, `billing`, etc. |
+| `route_reason` | text | yes | Human-readable explanation |
+| `routing_rule_version` | text | no | Version of routing rules applied |
+| `created_at` | timestamptz | no | Decision time |
+
+**Constraints**
+
+| Rule | Purpose |
+| --- | --- |
+| `UNIQUE (processing_run_id)` | A run has one accepted routing decision |
+| `UNIQUE (analysis_id)` | One route per analysis |
+
+Routing deserves its own table because FR-8 and NFR-4 require reconstructable
+routing decisions. Hiding it inside `email_analyses` would make model output and
+business policy look like one thing.
+
+---
+
+## 9. `sales_leads`
+
+Created only when the accepted category is a sales inquiry.
+
+| Field | Type | Null | Purpose |
+| --- | --- | --- | --- |
+| `id` | UUID | no | Primary key |
+| `processing_run_id` | UUID | no | -> `processing_runs.id` |
+| `analysis_id` | UUID | no | -> `email_analyses.id` |
+| `email_message_id` | UUID | no | Denormalized for lookup |
+| `customer_name` | text | yes | Extracted customer name |
+| `customer_type` | text | yes | Individual, company, partner, etc. |
+| `company_name` | text | yes | Extracted company name |
+| `contact_email` | text | no | Replyable email address |
+| `phone` | text | yes | Extracted phone number |
+| `address` | text | yes | Extracted address |
+| `website` | text | yes | Extracted website |
+| `service_requested` | text | yes | Product or service requested |
+| `requirement_summary` | text | yes | Business summary |
+| `budget_amount` | numeric(14,2) | yes | Extracted budget |
+| `budget_currency` | char(3) | yes | ISO currency code |
+| `urgency` | text | yes | Extracted urgency |
+| `lead_status` | enum | no | `new`, `review_required`, `qualified`, `discarded` |
+| `created_at` | timestamptz | no | Creation |
+| `updated_at` | timestamptz | no | Last modification |
+
+**Constraints**
+
+| Rule | Purpose |
+| --- | --- |
+| `UNIQUE (processing_run_id)` | Version 1 creates at most one lead per run |
+| `UNIQUE (analysis_id)` | Prevents duplicate lead creation from the same analysis |
+
+Version 1 assumes one lead per email, but the uniqueness is attached to the run
+and analysis rather than the email. That leaves room for reprocessing to produce
+a corrected lead while preserving the earlier one.
+
+---
+
+## 10. `email_drafts`
+
+Drafts are separate from analyses because they can be regenerated, edited,
+approved, or discarded independently.
+
+| Field | Type | Null | Purpose |
+| --- | --- | --- | --- |
+| `id` | UUID | no | Primary key |
+| `processing_run_id` | UUID | no | -> `processing_runs.id` |
+| `analysis_id` | UUID | no | -> `email_analyses.id` |
+| `email_message_id` | UUID | no | Denormalized for lookup |
+| `draft_version` | integer | no | 1, 2, 3... |
+| `draft_subject` | text | no | Proposed reply subject |
+| `draft_body` | text | no | Proposed reply body |
+| `status` | enum | no | Draft lifecycle |
+| `model_name` | text | no | Pinned model identifier |
+| `prompt_version` | text | no | Draft prompt version |
+| `input_hash` | text | no | Hash of draft-generation input |
+| `idempotency_key` | text | no | Stable key for this draft operation |
+| `created_at` | timestamptz | no | Creation |
+| `updated_at` | timestamptz | no | Last modification |
+
+**Constraints**
+
+| Rule | Purpose |
+| --- | --- |
+| `UNIQUE (analysis_id, draft_version)` | Allows regenerated versions without duplicate numbering |
+| `UNIQUE (idempotency_key)` | A retry cannot create another version 1 |
+
+**Status values:** `generated`, `reviewed`, `approved`, `edited`, `discarded`.
+
+`sent` is deliberately excluded in Version 1 because FR-13 says the system does
+not send replies. Adding a status that cannot happen makes operational reports
+less honest.
+
+---
+
+## 11. `manual_reviews`
+
+Manual review items represent work for a trusted internal reviewer.
+
+| Field | Type | Null | Purpose |
+| --- | --- | --- | --- |
+| `id` | UUID | no | Primary key |
+| `processing_run_id` | UUID | no | -> `processing_runs.id` |
+| `email_message_id` | UUID | no | Denormalized for lookup |
+| `analysis_id` | UUID | yes | Analysis under review, if one exists |
+| `reason` | enum | no | Why review is required |
+| `status` | enum | no | Review lifecycle |
+| `assigned_to` | text | yes | Reviewer identifier |
+| `review_notes` | text | yes | Human comments |
+| `resolved_category` | text | yes | Corrected category |
+| `resolved_at` | timestamptz | yes | Completion |
+| `created_at` | timestamptz | no | Queue time |
+| `updated_at` | timestamptz | no | Last modification |
+
+**Reasons:** `low_confidence`, `invalid_ai_response`, `unsupported_attachment`,
+`suspicious_content`, `missing_required_data`, `processing_failed`.
+
+**Statuses:** `pending`, `in_review`, `resolved`, `dismissed`.
+
+**Constraints**
+
+| Rule | Purpose |
+| --- | --- |
+| `UNIQUE NULLS NOT DISTINCT (processing_run_id, analysis_id, reason)` | Deduplicates reviews even when no analysis exists |
+
+The `NULLS NOT DISTINCT` choice depends on PostgreSQL 15+, which is compatible
+with our PostgreSQL 16 Docker decision.
+
+---
+
+## 12. `outbox_events`
+
+Outbox events record external effects that must happen after the business
+transaction commits.
+
+| Field | Type | Null | Purpose |
+| --- | --- | --- | --- |
+| `id` | UUID | no | Primary key |
+| `event_type` | text | no | `message_routed`, `sales_lead_created`, etc. |
+| `entity_type` | text | no | `routing_decision`, `sales_lead`, `manual_review` |
 | `entity_id` | UUID | no | Identifier of the referenced entity |
-| `payload` | jsonb | no | Everything the consumer needs, captured at commit time |
-| `status` | enum | no | `pending`, `sent`, `failed`, `dead` |
+| `dedupe_key` | text | no | Consumer-visible idempotency key |
+| `payload` | jsonb | no | Self-contained event payload |
+| `status` | enum | no | `pending`, `processing`, `sent`, `failed`, `dead` |
 | `attempts` | integer | no | Delivery attempts made |
 | `last_error` | text | yes | Most recent failure |
-| `available_at` | timestamptz | no | Earliest next delivery, for backoff |
+| `available_at` | timestamptz | no | Earliest next delivery time |
+| `claimed_by` | text | yes | Worker holding the delivery lease |
+| `lease_expires_at` | timestamptz | yes | Claim expiry for delivery recovery |
 | `created_at` | timestamptz | no | Enqueued |
 | `sent_at` | timestamptz | yes | Delivered |
 
-**Indexes:** `(status, available_at)` — the worker's only query pattern.
+**Constraints**
 
-The `payload` is self-contained by design: a consumer must not need to re-read the entity, whose state may have moved on since the event was raised.
+| Rule | Purpose |
+| --- | --- |
+| `UNIQUE (dedupe_key)` | Prevents duplicate notification intent |
 
-`dead` is a terminal state for events that exhausted retries. Events reaching it require intervention and must alert — an outbox nobody watches is a silent queue of undelivered work.
+**Indexes:** `(status, available_at)`, `(lease_expires_at) WHERE status = 'processing'`.
 
----
-
-## 10. Data we deliberately do not store
-
-Email bodies can contain anything. The system does not retain, and where detected should redact:
-
-passwords · one-time codes · card numbers · bank credentials · authentication tokens · identity documents · full raw headers unless needed · attachment contents
-
-This repository uses **fictional test emails only**. A real deployment requires agreement on retention duration, encryption at rest, access control, data residency, log redaction, and deletion on request — none of which are settled here.
+The payload is self-contained by design. A consumer should not need to re-read
+the business entity, because that entity may have changed since the event was
+raised.
 
 ---
 
-## 11. Build order
+## 13. Current outcome rule
+
+Only a completed or manual-review run may become current.
+
+When a reprocess succeeds, the transaction should:
+
+1. Set the old current run to `is_current = false`.
+2. Mark the new run as `is_current = true`.
+3. Commit the new analysis, route, optional lead, optional draft, and outbox
+   events together.
+
+If the transaction fails, the old current outcome remains intact.
+
+This is intentionally a small mutable pointer on top of append-only evidence.
+That is the right trade-off: operators need a current answer, while auditors need
+the full history.
+
+---
+
+## 14. Data we deliberately do not store
+
+Email bodies can contain anything. The system does not retain, and where detected
+should redact:
+
+passwords, one-time codes, card numbers, bank credentials, authentication
+tokens, identity documents, full raw headers unless needed, and attachment
+contents.
+
+This repository uses fictional test emails only. A real deployment requires
+agreement on retention duration, encryption at rest, access control, data
+residency, log redaction, and deletion on request.
+
+---
+
+## 15. Build order
 
 | Stage | Tables |
 | --- | --- |
-| First working slice | `email_messages`, `email_analyses`, `processing_attempts`, `email_drafts` |
-| Completing the Version 1 flow | `manual_reviews`, `sales_leads`, `outbox_events` |
+| Foundation | `mailboxes`, `email_messages`, `processing_runs`, `processing_attempts` |
+| First AI decision slice | `email_analyses`, `manual_reviews` |
+| Business outcome slice | `routing_decisions`, `sales_leads`, `email_drafts` |
+| External effect slice | `outbox_events` |
 
-This is a build order, not a feature split. The full Version 1 flow — low-confidence review, lead capture, team notification — needs all seven tables. The first four simply produce something that runs end to end soonest.
+This is a build order, not a feature split. The full Version 1 flow needs all
+tables, but the foundation gives us durable ingestion and observable processing
+before we spend model calls.
 
-## 12. Open items
+---
 
-1. **Which analysis is current.** Reprocessing creates a second analysis and nothing marks which is in force. Ordering by `created_at` breaks under concurrency; an explicit `superseded_by` reference or an `is_current` flag with a partial unique index is needed.
-2. **No lease on `processing`.** A worker that dies leaves the row claimed permanently. A `claimed_at` column plus a sweeper reclaiming rows past a threshold would close this.
-3. **`NULL` handling in the review key** — section 8.
-4. **Category taxonomy is not closed**, so `category` remains `text` rather than an enum. It cannot be constrained until the vocabulary is fixed.
-5. **`lead_status` values** are not yet agreed with any business process.
-6. **Retention policy** is undefined, so no deletion or archival mechanism is specified.
+## 16. Open items
+
+1. **Category taxonomy.** Categories remain `text` until the business vocabulary
+   is closed and tested against fixtures.
+2. **Confidence threshold calibration.** The schema records thresholds, but the
+   actual value must come from labelled examples.
+3. **Retention policy.** Message bodies, raw responses, and event payloads need a
+   documented deletion or archival policy before real data is processed.
+4. **Reviewer identity.** Version 1 stores reviewer identifiers as text. A real
+   review UI needs user identity and authorization.
+5. **Outbox ordering.** Version 1 guarantees dedupe and retry, not strict ordered
+   delivery across event types.

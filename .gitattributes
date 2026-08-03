@@ -1,0 +1,12 @@
+# Shell scripts must keep LF endings. With core.autocrlf=true a CRLF checkout
+# breaks the shebang — "bad interpreter: /usr/bin/env bash^M" — and the same
+# file fails inside a Linux container.
+*.sh text eol=lf
+
+# Piped into psql, including from inside a container.
+*.sql text eol=lf
+
+# Read by docker compose and by the containers themselves.
+.env.example text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
